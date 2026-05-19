@@ -72,10 +72,73 @@ audit status --run-id my-run
 audit report --run-id my-run --format md > report.md
 ```
 
-The agent uses **subscription billing** via your Claude.ai login — it does
-**not** call the metered API. The on-disk auth module scrubs
-`ANTHROPIC_API_KEY` from the environment so it can't silently route around
-the OAuth flow.
+By default the agent uses **subscription billing** via your Claude.ai
+login — it does **not** call the metered Anthropic API. The on-disk auth
+module scrubs `ANTHROPIC_API_KEY` from the environment so it can't
+silently route around the OAuth flow.
+
+## Using a different model / provider
+
+The auth module picks one of three modes, in this order:
+
+1. **LLM gateway** (OpenRouter, custom proxy, etc.) — when
+   `ANTHROPIC_BASE_URL` points away from `anthropic.com` AND
+   `ANTHROPIC_AUTH_TOKEN` is set. The gateway env is left intact;
+   only `ANTHROPIC_API_KEY` is scrubbed (it would otherwise outrank the
+   gateway token).
+2. **Subscription OAuth (headless)** — `CLAUDE_CODE_OAUTH_TOKEN` from
+   `claude setup-token`. Best for CI.
+3. **Subscription OAuth (interactive)** — `~/.claude/.credentials.json`
+   from `claude login`. Best for local dev.
+
+### OpenRouter
+
+OpenRouter exposes Claude-compatible Anthropic-API endpoints behind its
+own credit system; that lets you spend OpenRouter credits instead of an
+Anthropic subscription, and gives you access to Sonnet/Opus *and* other
+models through the same SDK path. See [OpenRouter's Agent SDK guide](https://openrouter.ai/docs/guides/community/anthropic-agent-sdk).
+
+```bash
+export ANTHROPIC_BASE_URL="https://openrouter.ai/api"
+export ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY"
+export ANTHROPIC_API_KEY=""           # must be explicitly empty / unset
+# optional: pick a non-Anthropic model
+export ANTHROPIC_MODEL="anthropic/claude-sonnet-4-6"
+# or e.g.: ANTHROPIC_MODEL="openai/gpt-5"
+#         ANTHROPIC_MODEL="google/gemini-2.5-pro"
+#         ANTHROPIC_MODEL="qwen/qwen3-coder-480b"
+
+audit auth-check                       # confirms "using LLM gateway at https://openrouter.ai/api"
+audit run --repo /path/to/target --run-id orun --max-cost-usd 30
+```
+
+Caveats:
+- Per-stage model overrides in `config/stages.yaml` are model **names**
+  (e.g. `claude-opus-4-7`); OpenRouter accepts slash-prefixed forms like
+  `anthropic/claude-opus-4-7`. Edit the YAML if you want different
+  providers per stage. Otherwise `ANTHROPIC_MODEL` forces every stage
+  onto one model.
+- Non-Claude models may not produce schema-compliant JSON as reliably.
+  The runner's schema-validation + repair turn still applies; quality
+  varies by model.
+- Tool-use semantics (Read/Grep/Glob/Bash) are part of the Claude Code
+  CLI, not the model — they work as long as the gateway speaks the
+  Anthropic Messages API.
+
+### Other gateways / cloud providers
+
+Same recipe — anything that exposes the Anthropic Messages API at a URL
++ a bearer token works:
+
+```bash
+export ANTHROPIC_BASE_URL="https://your-proxy.example.com"
+export ANTHROPIC_AUTH_TOKEN="$YOUR_TOKEN"
+unset ANTHROPIC_API_KEY
+```
+
+For Amazon Bedrock / Google Vertex / Microsoft Foundry, Claude Code has
+first-class env-var flags (`CLAUDE_CODE_USE_BEDROCK=1` etc.) that
+outrank everything else. See the [Claude Code auth docs](https://code.claude.com/docs/en/authentication).
 
 ## Cost containment
 

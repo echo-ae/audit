@@ -60,9 +60,19 @@ def auth_check() -> None:
         console.print(
             f"[green]OK[/green] using stored login from {status.credentials_file}"
         )
+    elif status.auth_mode == "gateway":
+        console.print(
+            f"[green]OK[/green] using LLM gateway at {status.gateway_base_url} "
+            "(ANTHROPIC_AUTH_TOKEN)"
+        )
+        if status.gateway_model:
+            console.print(f"          ANTHROPIC_MODEL={status.gateway_model}")
     if status.api_key_scrubbed:
         console.print("[yellow]scrubbed[/yellow] ANTHROPIC_API_KEY removed from env "
-                      "(it would have taken precedence over OAuth)")
+                      "(it would have outranked the active auth mode)")
+    if status.auth_token_scrubbed:
+        console.print("[yellow]scrubbed[/yellow] ANTHROPIC_AUTH_TOKEN removed from env "
+                      "(no gateway base URL set — leaving it would outrank subscription)")
     console.print(f"claude CLI: {status.claude_cli_path} ({status.claude_cli_version})")
 
 

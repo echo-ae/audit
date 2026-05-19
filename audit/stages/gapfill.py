@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 
-from audit.runner import AgentRunError, run_agent
+from audit.runner import AgentRunError, TransientAgentError, run_agent
 from audit.state import StateDB
 from audit.stages._common import StageContext, truncated_recon_summary
 
@@ -69,7 +69,7 @@ async def run_gapfill(ctx: StageContext, db: StateDB,
             artifact_name=f"gapfill_{_iter_tag(ctx.run_id, db)}",
             repair_attempts=sc.repair_attempts,
         )
-    except AgentRunError as e:
+    except (AgentRunError, TransientAgentError) as e:
         log.warning("[%s] gapfill failed: %s — skipping iteration", ctx.run_id, e)
         return 0
 

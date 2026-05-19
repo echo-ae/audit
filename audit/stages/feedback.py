@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from audit.runner import AgentRunError, run_agent
+from audit.runner import AgentRunError, TransientAgentError, run_agent
 from audit.state import StateDB
 from audit.stages._common import StageContext, truncated_recon_summary
 
@@ -44,7 +44,7 @@ async def run_feedback(ctx: StageContext, db: StateDB,
             artifact_name="feedback",
             repair_attempts=sc.repair_attempts,
         )
-    except AgentRunError as e:
+    except (AgentRunError, TransientAgentError) as e:
         log.warning("[%s] feedback failed: %s", ctx.run_id, e)
         return 0
 

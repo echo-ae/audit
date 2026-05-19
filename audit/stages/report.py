@@ -6,7 +6,7 @@ import json
 import logging
 from pathlib import Path
 
-from audit.runner import AgentRunError, run_agent
+from audit.runner import AgentRunError, TransientAgentError, run_agent
 from audit.state import StateDB
 from audit.stages._common import StageContext
 
@@ -60,7 +60,7 @@ async def run_report(ctx: StageContext, db: StateDB) -> Path:
             artifact_name="report_agent",
             repair_attempts=max(sc.repair_attempts, 2),  # report MUST validate
         )
-    except AgentRunError as e:
+    except (AgentRunError, TransientAgentError) as e:
         log.error("[%s] report agent failed: %s — emitting fallback report",
                   ctx.run_id, e)
         fallback = _build_fallback_report(ctx, db, reachable, target)

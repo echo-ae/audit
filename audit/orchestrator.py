@@ -9,6 +9,7 @@ from pathlib import Path
 
 from audit import stages
 from audit.config import HarnessConfig
+from audit.runner import QuotaExhaustedError
 from audit.state import StateDB
 from audit.stages._common import StageContext
 
@@ -119,6 +120,16 @@ async def run_pipeline(
 
     except CostExceeded as e:
         log.error(str(e))
+        db.finish_run(run_id, "aborted")
+        raise
+    except QuotaExhaustedError as e:
+        # Subscription quota exhausted — surface clearly; user must wait
+        # for the reset window. Run is resumable via --resume once quota
+        # returns.
+        log.error(
+            "[%s] subscription quota exhausted — aborting (resumable with --resume): %s",
+            run_id, str(e)[:300],
+        )
         db.finish_run(run_id, "aborted")
         raise
     except Exception:

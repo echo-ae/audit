@@ -6,7 +6,7 @@ import asyncio
 import logging
 from typing import Awaitable, Callable
 
-from audit.runner import AgentRunError, run_agent
+from audit.runner import AgentRunError, TransientAgentError, run_agent
 from audit.state import StateDB, Task
 from audit.stages._common import StageContext, truncated_recon_summary
 
@@ -80,7 +80,7 @@ async def run_hunt(
                     artifact_name=task.task_id,
                     repair_attempts=sc.repair_attempts,
                 )
-            except AgentRunError as e:
+            except (AgentRunError, TransientAgentError) as e:
                 log.warning("[%s] hunt task %s failed: %s", ctx.run_id, task.task_id, e)
                 db.update_task_status(task.task_id, "failed")
                 counters["tasks_failed"] += 1

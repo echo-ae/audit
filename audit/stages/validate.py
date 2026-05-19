@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from audit.runner import AgentRunError, run_agent
+from audit.runner import AgentRunError, TransientAgentError, run_agent
 from audit.state import Finding, StateDB
 from audit.stages._common import StageContext
 
@@ -60,7 +60,7 @@ async def run_validate(ctx: StageContext, db: StateDB) -> int:
                     artifact_name=f.finding_id,
                     repair_attempts=sc.repair_attempts,
                 )
-            except AgentRunError as e:
+            except (AgentRunError, TransientAgentError) as e:
                 log.warning("[%s] validate %s failed: %s", ctx.run_id, f.finding_id, e)
                 counters["failed"] += 1
                 # Treat unparseable validation as needs_more_info to avoid

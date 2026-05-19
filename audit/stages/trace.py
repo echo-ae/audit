@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from audit.runner import AgentRunError, run_agent
+from audit.runner import AgentRunError, TransientAgentError, run_agent
 from audit.state import Finding, StateDB
 from audit.stages._common import StageContext, truncated_recon_summary
 
@@ -54,7 +54,7 @@ async def run_trace(ctx: StageContext, db: StateDB) -> int:
                     artifact_name=f.finding_id,
                     repair_attempts=sc.repair_attempts,
                 )
-            except AgentRunError as e:
+            except (AgentRunError, TransientAgentError) as e:
                 log.warning("[%s] trace %s failed: %s", ctx.run_id, f.finding_id, e)
                 counters["failed"] += 1
                 # Conservative: mark unreachable on failure.

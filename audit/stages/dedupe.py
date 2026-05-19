@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from audit.runner import AgentRunError, run_agent
+from audit.runner import AgentRunError, TransientAgentError, run_agent
 from audit.state import StateDB
 from audit.stages._common import StageContext
 
@@ -42,7 +42,7 @@ async def run_dedupe(ctx: StageContext, db: StateDB) -> int:
             artifact_name="dedupe",
             repair_attempts=sc.repair_attempts,
         )
-    except AgentRunError as e:
+    except (AgentRunError, TransientAgentError) as e:
         log.warning("[%s] dedupe failed: %s — treating each finding as its own group",
                     ctx.run_id, e)
         # Fallback: one group per finding, all canonical.

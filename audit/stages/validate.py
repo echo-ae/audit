@@ -33,6 +33,10 @@ async def run_validate(ctx: StageContext, db: StateDB) -> int:
 
     async def _one(f: Finding) -> None:
         async with sem:
+            log.info(
+                "[%s] validate %s: starting severity=%s class=%s",
+                ctx.run_id, f.finding_id, f.severity, f.vuln_class,
+            )
             task = tasks_by_id.get(f.task_id)
             ctx_block = {
                 "attack_class": task.attack_class if task else f.vuln_class,
@@ -80,6 +84,7 @@ async def run_validate(ctx: StageContext, db: StateDB) -> int:
             db.add_artifact(ctx.run_id, "validate", f.finding_id, "jsonl",
                             str(result.artifact_path))
             counters[verdict] = counters.get(verdict, 0) + 1
+            log.info("[%s] validate %s: verdict=%s", ctx.run_id, f.finding_id, verdict)
 
     await asyncio.gather(*(_one(f) for f in unvalidated))
     log.info(

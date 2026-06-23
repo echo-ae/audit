@@ -33,6 +33,10 @@ async def run_trace(ctx: StageContext, db: StateDB) -> int:
         async with sem:
             if db.get_trace(f.finding_id) is not None:
                 return  # already traced (resume)
+            log.info(
+                "[%s] trace %s: starting severity=%s class=%s",
+                ctx.run_id, f.finding_id, f.severity, f.vuln_class,
+            )
             user_input = {
                 "finding": f.raw_json,
                 "recon_summary": truncated_recon_summary(recon_summary),
@@ -74,8 +78,10 @@ async def run_trace(ctx: StageContext, db: StateDB) -> int:
                             str(result.artifact_path))
             if result.payload.get("reachable"):
                 counters["reachable"] += 1
+                log.info("[%s] trace %s: reachable", ctx.run_id, f.finding_id)
             else:
                 counters["unreachable"] += 1
+                log.info("[%s] trace %s: unreachable", ctx.run_id, f.finding_id)
 
     await asyncio.gather(*(_one(f) for f in canonicals))
     log.info(

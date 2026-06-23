@@ -46,6 +46,10 @@ async def run_report(ctx: StageContext, db: StateDB) -> Path:
         return out_path
 
     try:
+        log.info(
+            "[%s] report: starting report agent for %d reachable findings (model=%s)",
+            ctx.run_id, len(ready), sc.model,
+        )
         result = await run_agent(
             stage="report",
             prompt_file=ctx.prompt("08-report"),

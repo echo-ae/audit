@@ -25,6 +25,10 @@ async def run_feedback(ctx: StageContext, db: StateDB,
     payload = [{"finding": f.raw_json, "trace": tr} for f, tr in reachable]
 
     try:
+        log.info(
+            "[%s] feedback: starting with %d reachable traces (model=%s)",
+            ctx.run_id, len(reachable), sc.model,
+        )
         result = await run_agent(
             stage="feedback",
             prompt_file=ctx.prompt("07-feedback"),

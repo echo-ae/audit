@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import sys
 import uuid
 from pathlib import Path
@@ -16,16 +15,8 @@ from rich.logging import RichHandler
 from rich.table import Table
 
 from audit.auth import AuthError, configure_auth
-
-
-def _allow_api_key_from_env_or_flag(flag: bool) -> bool:
-    """A user may opt into api_key mode via --allow-api-key OR via
-    AUDIT_ALLOW_API_KEY=1 in the env. Either is sufficient."""
-    if flag:
-        return True
-    return os.environ.get("AUDIT_ALLOW_API_KEY", "").strip() not in ("", "0", "false", "False")
 from audit.config import load_config
-from audit.orchestrator import CostExceeded, run_pipeline
+from audit.orchestrator import run_pipeline
 from audit.state import StateDB
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -56,45 +47,21 @@ def main(ctx: click.Context, verbose: bool) -> None:
 
 
 @main.command("auth-check")
-@click.option("--allow-api-key", is_flag=True, default=False,
-              help="Honor ANTHROPIC_API_KEY for metered Anthropic billing "
-                   "(also via AUDIT_ALLOW_API_KEY=1).")
-def auth_check(allow_api_key: bool) -> None:
-    """Verify Claude Code auth is configured correctly."""
-    allow = _allow_api_key_from_env_or_flag(allow_api_key)
+def auth_check() -> None:
+    """Verify Codex ChatGPT subscription auth is configured correctly."""
     try:
-        status = configure_auth(allow_api_key=allow)
+        status = configure_auth()
     except AuthError as e:
         console.print(f"[red]auth error:[/red] {e}")
         sys.exit(2)
-    if status.auth_mode == "oauth_token":
-        console.print("[green]OK[/green] using CLAUDE_CODE_OAUTH_TOKEN")
-    elif status.auth_mode == "api_key":
+    if status.auth_mode == "chatgpt_subscription":
         console.print(
-            "[green]OK[/green] using ANTHROPIC_API_KEY (metered Anthropic API billing)"
+            "[green]OK[/green] using Codex ChatGPT subscription login"
         )
-    elif status.auth_mode == "keychain_login":
-        console.print(
-            f"[green]OK[/green] using stored login from {status.credentials_file}"
-        )
-    elif status.auth_mode == "macos_keychain_login":
-        console.print(
-            "[green]OK[/green] using macOS Keychain-backed Claude Code login"
-        )
-    elif status.auth_mode == "gateway":
-        console.print(
-            f"[green]OK[/green] using LLM gateway at {status.gateway_base_url} "
-            "(ANTHROPIC_AUTH_TOKEN)"
-        )
-        if status.gateway_model:
-            console.print(f"          ANTHROPIC_MODEL={status.gateway_model}")
-    if status.api_key_scrubbed:
-        console.print("[yellow]scrubbed[/yellow] ANTHROPIC_API_KEY removed from env "
-                      "(it would have outranked the active auth mode)")
-    if status.auth_token_scrubbed:
-        console.print("[yellow]scrubbed[/yellow] ANTHROPIC_AUTH_TOKEN removed from env "
-                      "(no gateway base URL set — leaving it would outrank subscription)")
-    console.print(f"claude CLI: {status.claude_cli_path} ({status.claude_cli_version})")
+        console.print(f"status: {status.login_status}")
+    if status.credentials_file:
+        console.print(f"credential cache: {status.credentials_file}")
+    console.print(f"codex CLI: {status.codex_cli_path} ({status.codex_cli_version})")
 
 
 @main.command("run")
@@ -102,10 +69,8 @@ def auth_check(allow_api_key: bool) -> None:
               help="Path to the target source-code repo.")
 @click.option("--run-id", default=None, help="Run identifier (default: random).")
 @click.option("--resume", is_flag=True, help="Resume an existing run-id.")
-@click.option("--max-cost-usd", default=None, type=float,
-              help="Abort if cumulative cost crosses this threshold.")
 @click.option("--max-concurrency", default=None, type=int,
-              help="Cap every stage's concurrency to this (cost containment).")
+              help="Cap every stage's concurrency to this.")
 @click.option("--max-recon-tasks", default=None, type=int,
               help="Cap the number of initial Hunt tasks Recon may emit.")
 @click.option("--target-url", default=None,
@@ -122,19 +87,14 @@ def auth_check(allow_api_key: bool) -> None:
                    "rules / exclusions; passed verbatim to every stage.")
 @click.option("--config", "config_path", default=None, type=click.Path(),
               help="Override config/stages.yaml.")
-@click.option("--allow-api-key", is_flag=True, default=False,
-              help="Honor ANTHROPIC_API_KEY for metered Anthropic billing "
-                   "(also via AUDIT_ALLOW_API_KEY=1).")
-def run(repo: str, run_id: str | None, resume: bool, max_cost_usd: float | None,
+def run(repo: str, run_id: str | None, resume: bool,
         max_concurrency: int | None, max_recon_tasks: int | None,
         target_url: str | None, target_creds: tuple[str, ...],
         scope_notes_path: str | None,
-        config_path: str | None,
-        allow_api_key: bool) -> None:
+        config_path: str | None) -> None:
     """Run the full 8-stage pipeline against a target repo."""
-    allow = _allow_api_key_from_env_or_flag(allow_api_key)
     try:
-        configure_auth(allow_api_key=allow)
+        configure_auth()
     except AuthError as e:
         console.print(f"[red]auth error:[/red] {e}")
         sys.exit(2)
@@ -175,16 +135,12 @@ def run(repo: str, run_id: str | None, resume: bool, max_cost_usd: float | None,
             run_id=run_id,
             db=db,
             config=config,
-            max_cost_usd=max_cost_usd,
             resume=resume,
             max_recon_tasks=max_recon_tasks,
             live_target=live_target,
             scope_notes=scope_notes,
         ))
         console.print(f"[green]done[/green] run_id={run_id} report={report}")
-    except CostExceeded as e:
-        console.print(f"[yellow]aborted[/yellow] {e}")
-        sys.exit(3)
     except Exception as e:
         console.print(f"[red]failed[/red] {type(e).__name__}: {e}")
         raise
@@ -195,7 +151,7 @@ def run(repo: str, run_id: str | None, resume: bool, max_cost_usd: float | None,
 @main.command("status")
 @click.option("--run-id", default=None)
 def status(run_id: str | None) -> None:
-    """Show pipeline status: tasks, findings, traces, cost."""
+    """Show pipeline status: tasks, findings, traces, usage."""
     db = StateDB(DB_PATH)
     try:
         if run_id is None:
@@ -236,10 +192,10 @@ def _show_runs_table(db: StateDB) -> None:
     t.add_column("run_id")
     t.add_column("repo")
     t.add_column("status")
-    t.add_column("cost ($)")
+    t.add_column("usage rows")
     for r in runs:
         t.add_row(r["run_id"], r["repo_path"], r["status"],
-                  f"{db.total_cost(r['run_id']):.4f}")
+                  str(db.usage_record_count(r["run_id"])))
     console.print(t)
 
 
@@ -260,7 +216,7 @@ def _show_run_detail(db: StateDB, run_id: str) -> None:
     t.add_row("findings (confirmed)", str(len(confirmed)))
     t.add_row("findings (canonical)", str(len(canonical)))
     t.add_row("findings (reachable)", str(len(reachable)))
-    t.add_row("total cost ($)", f"{db.total_cost(run_id):.4f}")
+    t.add_row("usage records", str(db.usage_record_count(run_id)))
     console.print(t)
 
 

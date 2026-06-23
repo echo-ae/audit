@@ -35,7 +35,7 @@ class HarnessConfig:
 
     def cap_concurrency(self, cap: int) -> None:
         """Mutate every stage's concurrency to min(current, cap). Useful
-        for cost-contained test runs."""
+        for usage-contained test runs."""
         if cap < 1:
             raise ValueError("concurrency cap must be >= 1")
         for sc in self.stages.values():

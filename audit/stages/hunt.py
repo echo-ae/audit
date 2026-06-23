@@ -57,6 +57,10 @@ async def run_hunt(
                     counters["skipped"] += 1
                     return
             db.update_task_status(task.task_id, "running")
+            log.info(
+                "[%s] hunt %s: starting attack_class=%s scope=%s",
+                ctx.run_id, task.task_id, task.attack_class, task.scope_hint[:120],
+            )
             scratch = ctx.work_dir("hunt", task.task_id)
             subsystem_hint = task.target_files[0] if task.target_files else None
             user_input = {
@@ -123,8 +127,9 @@ async def run_hunt(
                             str(scratch))
             counters["tasks_done"] += 1
             log.info(
-                "[%s] hunt %s: %d findings (cost=$%.4f)",
-                ctx.run_id, task.task_id, len(findings), result.cost_usd or 0.0,
+                "[%s] hunt %s: %d findings usage_recorded=%s",
+                ctx.run_id, task.task_id, len(findings),
+                bool(result.raw_result_message.get("usage")),
             )
 
     await asyncio.gather(*(_one(t) for t in pending))

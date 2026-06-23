@@ -451,6 +451,13 @@ class StateDB:
         ).fetchone()
         return float(row["total"]) if row else 0.0
 
+    def usage_record_count(self, run_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS total FROM costs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        return int(row["total"]) if row else 0
+
     # ---------- artifacts ----------
 
     def add_artifact(

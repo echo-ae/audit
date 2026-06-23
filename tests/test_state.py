@@ -93,7 +93,7 @@ def test_finding_validation_and_dedupe(tmp_path: Path) -> None:
     db.close()
 
 
-def test_cost_aggregation(tmp_path: Path) -> None:
+def test_usage_record_count(tmp_path: Path) -> None:
     db = StateDB(tmp_path / "state.db")
     rid = db.create_run("/r", "test_run")
     db.record_cost(rid, "hunt", "t_1", {"total_cost_usd": 0.01, "usage": {
@@ -102,5 +102,5 @@ def test_cost_aggregation(tmp_path: Path) -> None:
     db.record_cost(rid, "hunt", "t_2", {"total_cost_usd": 0.02, "usage": {
         "input_tokens": 200, "output_tokens": 100,
     }, "num_turns": 5, "duration_ms": 4321})
-    assert abs(db.total_cost(rid) - 0.03) < 1e-9
+    assert db.usage_record_count(rid) == 2
     db.close()

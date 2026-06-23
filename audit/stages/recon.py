@@ -48,11 +48,11 @@ async def run_recon(ctx: StageContext, db: StateDB, max_tasks: int = DEFAULT_MAX
         db.add_task(ctx.run_id, task)
 
     log.info(
-        "[%s] recon done: subsystems=%d entry_points=%d initial_tasks=%d cost=$%.4f",
+        "[%s] recon done: subsystems=%d entry_points=%d initial_tasks=%d usage_recorded=%s",
         ctx.run_id,
         len(payload.get("subsystems", [])),
         len(payload.get("architecture", {}).get("entry_points", [])),
         len(payload.get("initial_tasks", [])),
-        result.cost_usd or 0.0,
+        bool(result.raw_result_message.get("usage")),
     )
     return payload

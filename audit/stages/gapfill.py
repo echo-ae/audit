@@ -11,7 +11,7 @@ from audit.stages._common import StageContext, truncated_recon_summary
 
 log = logging.getLogger(__name__)
 
-# Gapfill defaults to a modest number — large counts amplify cost
+# Gapfill defaults to a modest number — large counts amplify usage
 # quadratically at low concurrency, and most projects don't need 30
 # extra Hunt tasks per iteration. Override via CLI if needed.
 DEFAULT_MAX_NEW_TASKS = 8
@@ -36,6 +36,10 @@ async def run_gapfill(ctx: StageContext, db: StateDB,
     # we pass findings_count only; the gapfill agent re-reads code itself.
 
     sc = ctx.stage("gapfill")
+    log.info(
+        "[%s] gapfill: analyzing %d completed tasks (model=%s)",
+        ctx.run_id, len(completed), sc.model,
+    )
     completed_payload = [
         {
             "task_id": t.task_id,
@@ -55,6 +59,8 @@ async def run_gapfill(ctx: StageContext, db: StateDB,
         **ctx.extras(),
     }
     try:
+        artifact_name = f"gapfill_{_iter_tag(ctx.run_id, db)}"
+        log.info("[%s] gapfill %s: starting", ctx.run_id, artifact_name)
         result = await run_agent(
             stage="gapfill",
             prompt_file=ctx.prompt("04-gapfill"),
@@ -67,7 +73,7 @@ async def run_gapfill(ctx: StageContext, db: StateDB,
             max_turns=sc.max_turns,
             permission_mode=sc.permission_mode,
             artifact_dir=ctx.results_dir("gapfill"),
-            artifact_name=f"gapfill_{_iter_tag(ctx.run_id, db)}",
+            artifact_name=artifact_name,
             repair_attempts=sc.repair_attempts,
         )
     except (AgentRunError, TransientAgentError) as e:

@@ -1,38 +1,22 @@
-"""Run one agent: open a ClaudeSDKClient session, send a JSON input,
-parse + schema-validate the final JSON output, and persist a JSONL
-artifact of every message exchanged.
+"""Run one Codex agent and validate its schema-shaped final output.
 
-Always uses ClaudeSDKClient (not query()) so that a schema-validation
-failure can be followed up with a repair turn inside the same session.
-
-API-error handling: the Claude CLI surfaces 529 Overloaded and
-subscription-quota-exhausted errors as `ResultMessage(is_error=True)` with
-the error text in place of a real assistant response. We detect this
-BEFORE schema validation, classify the error, and either retry with
-exponential backoff (transient) or raise QuotaExhaustedError (terminal).
+Each call starts a local Codex SDK thread, sends one JSON user payload, records
+SDK result summaries to a JSONL artifact, validates the final JSON object, and
+uses repair turns in the same thread when schema validation fails.
 """
 
 from __future__ import annotations
 
 import asyncio
 import dataclasses
+import importlib
 import json
 import logging
 import time
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-
-from claude_agent_sdk import (
-    AssistantMessage,
-    ClaudeAgentOptions,
-    ClaudeSDKClient,
-    ResultMessage,
-    TextBlock,
-    ThinkingBlock,
-    ToolResultBlock,
-    ToolUseBlock,
-)
 
 from audit.json_utils import extract_json, validate_schema
 
@@ -56,29 +40,28 @@ class AgentResult:
 
 
 class AgentRunError(RuntimeError):
-    """Schema validation failed after repair attempts (model produced
-    parseable output that didn't match the schema)."""
+    """Schema validation failed after repair attempts."""
+
+
+class AgentSetupError(RuntimeError):
+    """Local Codex SDK/runtime setup is missing or unusable."""
 
 
 class TransientAgentError(RuntimeError):
-    """API returned a transient error (529 Overloaded, generic 5xx).
-    The agent call should be retried with backoff."""
+    """Codex returned a retryable service, timeout, or rate-limit error."""
 
 
 class QuotaExhaustedError(RuntimeError):
-    """The Claude subscription has run out of quota. Don't retry — abort
-    the pipeline and let the user wait for the reset window."""
+    """The Codex subscription/session quota is exhausted until reset."""
 
 
 _QUOTA_MARKERS = (
     "out of extra usage",
     "usage limit reached",
-    # Subscription session/usage caps that reset on a timer, e.g.
-    # "You've hit your session limit · resets 5:10am (UTC)". The reset is
-    # often hours out, so backoff-retrying is futile — treat it as terminal
-    # and let the caller abort into a resumable state.
+    "chatgpt usage limit",
     "session limit",
     "your plan has no remaining",
+    "quota exhausted",
 )
 
 _TRANSIENT_MARKERS = (
@@ -89,19 +72,21 @@ _TRANSIENT_MARKERS = (
     "api error: 504",
     "api error: 500",
     "rate_limit",
+    "rate limit reached",
     "temporarily unavailable",
     "service unavailable",
+    "server busy",
+    "transport closed",
+    "timeout",
 )
 
 
 def _classify_api_error(text: str) -> tuple[str, type[RuntimeError]]:
-    """Return (label, exception_class) for an is_error response."""
     t = (text or "").lower()
     if any(m in t for m in _QUOTA_MARKERS):
         return "quota_exhausted", QuotaExhaustedError
     if any(m in t for m in _TRANSIENT_MARKERS):
         return "transient", TransientAgentError
-    # Default to transient — better to retry once than abort on classification miss.
     return "unknown_api_error", TransientAgentError
 
 
@@ -123,14 +108,9 @@ async def run_agent(
     transient_retries: int = 3,
     transient_base_delay: float = 30.0,
 ) -> AgentResult:
-    """Run one agent, retrying transient API errors with exponential backoff.
+    """Run one Codex agent, retrying transient errors with backoff."""
+    del max_turns, permission_mode  # Codex SDK thread config owns turn policy.
 
-    Raises `QuotaExhaustedError` if the subscription is out of quota
-    (caller should abort the run). Raises `TransientAgentError` if all
-    backoff retries are exhausted. Raises `AgentRunError` if the model
-    produced parseable output that doesn't match the schema even after
-    repair turns.
-    """
     last_exc: RuntimeError | None = None
     for attempt in range(transient_retries + 1):
         try:
@@ -143,8 +123,6 @@ async def run_agent(
                 model=model,
                 cwd=cwd,
                 add_dirs=add_dirs,
-                max_turns=max_turns,
-                permission_mode=permission_mode,
                 artifact_dir=artifact_dir,
                 artifact_name=artifact_name,
                 repair_attempts=repair_attempts,
@@ -157,9 +135,13 @@ async def run_agent(
                 break
             delay = min(transient_base_delay * (2 ** attempt), 240.0)
             log.warning(
-                "[%s/%s] transient API error (attempt %d/%d): %s — retrying in %.0fs",
-                stage, artifact_name, attempt + 1, transient_retries + 1,
-                str(e)[:160], delay,
+                "[%s/%s] transient Codex error (attempt %d/%d): %s; retrying in %.0fs",
+                stage,
+                artifact_name,
+                attempt + 1,
+                transient_retries + 1,
+                str(e)[:160],
+                delay,
             )
             await asyncio.sleep(delay)
     assert last_exc is not None
@@ -176,118 +158,148 @@ async def _run_agent_once(
     model: str,
     cwd: Path,
     add_dirs: list[Path] | None,
-    max_turns: int,
-    permission_mode: str,
     artifact_dir: Path,
     artifact_name: str,
     repair_attempts: int,
 ) -> AgentResult:
-    """Single attempt. Raises TransientAgentError / QuotaExhaustedError
-    before schema validation if the API returned is_error=True."""
     artifact_dir.mkdir(parents=True, exist_ok=True)
     artifact_path = artifact_dir / f"{artifact_name}.jsonl"
     cwd.mkdir(parents=True, exist_ok=True)
 
-    system_prompt = prompt_file.read_text()
-    # Append the literal schema body so the model never has to guess
-    # field names — this drastically reduces schema-validation failures
-    # on the first attempt and frees up the repair budget for real
-    # ambiguities.
-    schema_text = schema_file.read_text()
-    system_prompt += (
-        "\n\n# Output schema\n\n"
-        "Your output MUST validate against this JSON Schema. "
-        "Pay attention to nested objects, required fields, and "
-        "`additionalProperties: false`.\n\n"
-        f"```json\n{schema_text}\n```\n"
-    )
-    options = ClaudeAgentOptions(
-        system_prompt=system_prompt,
-        allowed_tools=allowed_tools,
-        model=model,
-        max_turns=max_turns,
-        cwd=str(cwd),
-        add_dirs=[str(p) for p in (add_dirs or [])],
-        permission_mode=permission_mode,
-        setting_sources=[],
-    )
-
+    system_prompt = _build_system_prompt(prompt_file, schema_file)
+    schema = _load_codex_output_schema(schema_file)
     initial_prompt = json.dumps(user_input, ensure_ascii=False)
+    sandbox_name = _sandbox_name_for_tools(allowed_tools)
+    sdk = _load_codex_sdk()
+    started_at = time.monotonic()
+
+    _log_progress(
+        event="start",
+        stage=stage,
+        artifact_name=artifact_name,
+        model=model,
+        elapsed_s=0,
+    )
 
     last_text = ""
     last_result_msg: dict[str, Any] = {}
     repair_used = False
 
     with artifact_path.open("w") as art:
-        _write_artifact(art, {"kind": "meta", "stage": stage, "model": model, "started_at": time.time()})
+        _write_artifact(
+            art,
+            {
+                "kind": "meta",
+                "provider": "codex",
+                "stage": stage,
+                "model": model,
+                "sandbox": sandbox_name,
+                "started_at": time.time(),
+            },
+        )
         _write_artifact(art, {"kind": "user", "text": initial_prompt[:50000]})
 
         try:
-            sdk_ctx = ClaudeSDKClient(options=options)
-            client = await sdk_ctx.__aenter__()
+            codex_config = sdk.CodexConfig(
+                config_overrides=_config_overrides_for_add_dirs(add_dirs or [])
+            )
+            async with sdk.AsyncCodex(config=codex_config) as codex:
+                thread = await codex.thread_start(
+                    developer_instructions=system_prompt,
+                    model=model,
+                    cwd=str(cwd),
+                    sandbox=_sdk_sandbox(sdk, sandbox_name),
+                    approval_mode=sdk.ApprovalMode.auto_review,
+                    ephemeral=True,
+                )
+                _write_artifact(
+                    art,
+                    {
+                        "kind": "thread",
+                        "thread_id": getattr(thread, "id", None),
+                        "cwd": str(cwd),
+                        "add_dirs": [str(p) for p in (add_dirs or [])],
+                    },
+                )
+
+                result = await _run_turn_with_heartbeat(
+                    thread,
+                    initial_prompt,
+                    output_schema=schema,
+                    sandbox=_sdk_sandbox(sdk, sandbox_name),
+                    stage=stage,
+                    artifact_name=artifact_name,
+                    model=model,
+                    started_at=started_at,
+                )
+                last_text, last_result_msg = _result_to_text_and_dict(result, thread)
+                _write_artifact(art, {"kind": "turn_result", **last_result_msg})
+
+                errors = _validate(last_text, schema_file)
+                attempts = 0
+                while errors and attempts < repair_attempts:
+                    attempts += 1
+                    repair_used = True
+                    _log_progress(
+                        event=f"repair attempt {attempts}",
+                        stage=stage,
+                        artifact_name=artifact_name,
+                        model=model,
+                        elapsed_s=time.monotonic() - started_at,
+                    )
+                    repair_prompt = _build_repair_prompt(last_text, errors, schema_file)
+                    _write_artifact(
+                        art,
+                        {"kind": "repair_request", "text": repair_prompt[:50000]},
+                    )
+                    result = await _run_turn_with_heartbeat(
+                        thread,
+                        repair_prompt,
+                        output_schema=schema,
+                        sandbox=_sdk_sandbox(sdk, sandbox_name),
+                        stage=stage,
+                        artifact_name=artifact_name,
+                        model=model,
+                        started_at=started_at,
+                    )
+                    last_text, last_result_msg = _result_to_text_and_dict(result, thread)
+                    _write_artifact(art, {"kind": "repair_result", **last_result_msg})
+                    errors = _validate(last_text, schema_file)
+
+                if errors:
+                    _write_artifact(art, {"kind": "schema_errors", "errors": errors})
+                    raise AgentRunError(
+                        f"[{stage}/{artifact_name}] schema validation failed after "
+                        f"{repair_attempts} repair attempts: {errors[:5]}"
+                    )
+
+                payload = _extract_payload_for_schema(last_text, schema_file)
+                _write_artifact(art, {"kind": "final_payload", "payload": payload})
+        except AgentRunError:
+            raise
         except Exception as e:
-            if "timeout" in str(e).lower() or "initialize" in str(e).lower():
-                raise TransientAgentError(
-                    f"[{stage}/{artifact_name}] SDK initialize timeout: {e}"
-                ) from e
+            label, exc_cls = _classify_api_error(str(e))
+            if exc_cls is QuotaExhaustedError:
+                raise QuotaExhaustedError(f"[{stage}/{artifact_name}] {label}: {e}") from e
+            if exc_cls is TransientAgentError:
+                raise TransientAgentError(f"[{stage}/{artifact_name}] {label}: {e}") from e
             raise
 
-        try:
-            await client.query(initial_prompt)
-            last_text, last_result_msg = await _drain(client, art)
-
-            # Before schema validation: was this a real model response, or
-            # did the CLI surface an API error as the assistant text?
-            if last_result_msg.get("is_error"):
-                label, exc_cls = _classify_api_error(last_text)
-                _write_artifact(art, {"kind": "api_error", "classification": label,
-                                      "text": last_text[:1000]})
-                raise exc_cls(
-                    f"[{stage}/{artifact_name}] {label}: "
-                    f"{(last_text or '').strip()[:300]}"
-                )
-
-            attempts = 0
-            errors = _validate(last_text, schema_file)
-            while errors and attempts < repair_attempts:
-                attempts += 1
-                repair_used = True
-                repair_prompt = _build_repair_prompt(last_text, errors, schema_file)
-                _write_artifact(art, {"kind": "repair_request", "text": repair_prompt[:50000]})
-                await client.query(repair_prompt)
-                last_text, last_result_msg = await _drain(client, art)
-                # An API error on the repair turn is also retry-worthy.
-                if last_result_msg.get("is_error"):
-                    label, exc_cls = _classify_api_error(last_text)
-                    _write_artifact(art, {"kind": "api_error_on_repair",
-                                          "classification": label,
-                                          "text": last_text[:1000]})
-                    raise exc_cls(
-                        f"[{stage}/{artifact_name}] {label} on repair turn: "
-                        f"{(last_text or '').strip()[:300]}"
-                    )
-                errors = _validate(last_text, schema_file)
-
-            if errors:
-                _write_artifact(art, {"kind": "schema_errors", "errors": errors})
-                raise AgentRunError(
-                    f"[{stage}/{artifact_name}] schema validation failed after "
-                    f"{repair_attempts} repair attempts: {errors[:5]}"
-                )
-
-            payload = extract_json(last_text)
-            _write_artifact(art, {"kind": "final_payload", "payload": payload})
-        finally:
-            await sdk_ctx.__aexit__(None, None, None)
-
     usage = last_result_msg.get("usage") or {}
+    _log_progress(
+        event="complete",
+        stage=stage,
+        artifact_name=artifact_name,
+        model=model,
+        elapsed_s=time.monotonic() - started_at,
+    )
     return AgentResult(
         payload=payload,
-        cost_usd=last_result_msg.get("total_cost_usd"),
+        cost_usd=None,
         input_tokens=usage.get("input_tokens"),
         output_tokens=usage.get("output_tokens"),
         cache_read_tokens=usage.get("cache_read_input_tokens"),
-        cache_creation_tokens=usage.get("cache_creation_input_tokens"),
+        cache_creation_tokens=None,
         num_turns=last_result_msg.get("num_turns"),
         duration_ms=last_result_msg.get("duration_ms"),
         session_id=last_result_msg.get("session_id"),
@@ -297,34 +309,284 @@ async def _run_agent_once(
     )
 
 
-async def _drain(client: ClaudeSDKClient, art) -> tuple[str, dict[str, Any]]:
-    """Consume the response stream, write each message to the JSONL
-    artifact, and return (concatenated assistant text from last
-    assistant message, result_message_dict)."""
-    text_chunks: list[str] = []
-    result_msg: dict[str, Any] = {}
-    last_assistant_text: list[str] = []
+def _load_codex_sdk() -> Any:
+    try:
+        return importlib.import_module("openai_codex")
+    except ModuleNotFoundError as e:
+        raise AgentSetupError(
+            "Missing Python package `openai-codex`. Install project "
+            "dependencies with `pip install -e .`."
+        ) from e
 
-    async for msg in client.receive_response():
-        _write_artifact(art, _serialize_message(msg))
-        if isinstance(msg, AssistantMessage):
-            last_assistant_text = []
-            for block in msg.content:
-                if isinstance(block, TextBlock):
-                    last_assistant_text.append(block.text)
-            text_chunks.append("".join(last_assistant_text))
-        elif isinstance(msg, ResultMessage):
-            result_msg = _result_to_dict(msg)
 
-    final_text = "".join(last_assistant_text) if last_assistant_text else (
-        text_chunks[-1] if text_chunks else ""
+def _load_codex_output_schema(schema_file: Path) -> dict:
+    schema = _load_schema_with_inlined_refs(schema_file)
+    return _to_codex_output_schema(schema)
+
+
+def _load_schema_with_inlined_refs(schema_file: Path) -> dict:
+    return _inline_external_refs(
+        json.loads(schema_file.read_text()),
+        schemas_dir=schema_file.parent,
+        ref_stack=(schema_file.name,),
     )
-    return final_text, result_msg
+
+
+def _inline_external_refs(value: Any, *, schemas_dir: Path, ref_stack: tuple[str, ...]) -> Any:
+    if isinstance(value, list):
+        return [
+            _inline_external_refs(item, schemas_dir=schemas_dir, ref_stack=ref_stack)
+            for item in value
+        ]
+    if not isinstance(value, dict):
+        return value
+
+    ref = value.get("$ref")
+    if isinstance(ref, str) and not ref.startswith("#"):
+        if ref in ref_stack:
+            chain = " -> ".join([*ref_stack, ref])
+            raise AgentSetupError(f"Cyclic schema reference: {chain}")
+        target = schemas_dir / ref
+        if not target.exists():
+            raise AgentSetupError(f"Missing schema reference `{ref}` from {schemas_dir}")
+        target_schema = json.loads(target.read_text())
+        return _inline_external_refs(
+            target_schema,
+            schemas_dir=schemas_dir,
+            ref_stack=(*ref_stack, ref),
+        )
+
+    return {
+        key: _inline_external_refs(child, schemas_dir=schemas_dir, ref_stack=ref_stack)
+        for key, child in value.items()
+    }
+
+
+def _to_codex_output_schema(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_to_codex_output_schema(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    required = set(value.get("required") or [])
+    converted = {
+        key: _to_codex_output_schema(child)
+        for key, child in value.items()
+        if key != "$schema"
+    }
+
+    if _is_object_schema(converted):
+        properties = converted.get("properties") or {}
+        for name, property_schema in list(properties.items()):
+            if name not in required:
+                properties[name] = _make_nullable_schema(property_schema)
+        converted["additionalProperties"] = False
+        converted["required"] = list(properties)
+
+    return converted
+
+
+def _make_nullable_schema(schema: Any) -> Any:
+    if not isinstance(schema, dict) or _schema_allows_null(schema):
+        return schema
+
+    nullable = dict(schema)
+    schema_type = nullable.get("type")
+    if isinstance(schema_type, str):
+        nullable["type"] = [schema_type, "null"]
+    elif isinstance(schema_type, list):
+        nullable["type"] = [*schema_type, "null"]
+    else:
+        nullable["anyOf"] = [schema, {"type": "null"}]
+
+    enum = nullable.get("enum")
+    if isinstance(enum, list) and None not in enum:
+        nullable["enum"] = [*enum, None]
+
+    return nullable
+
+
+def _schema_allows_null(schema: dict) -> bool:
+    schema_type = schema.get("type")
+    return schema_type == "null" or (
+        isinstance(schema_type, list) and "null" in schema_type
+    )
+
+
+def _is_object_schema(schema: dict) -> bool:
+    schema_type = schema.get("type")
+    return (
+        schema_type == "object"
+        or (isinstance(schema_type, list) and "object" in schema_type)
+        or "properties" in schema
+    )
+
+
+def _extract_payload_for_schema(text: str, schema_file: Path) -> Any:
+    payload = extract_json(text)
+    schema = _load_schema_with_inlined_refs(schema_file)
+    return _strip_null_optional_fields(payload, schema)
+
+
+def _strip_null_optional_fields(payload: Any, schema: Any) -> Any:
+    if isinstance(payload, list):
+        item_schema = schema.get("items") if isinstance(schema, dict) else None
+        return [_strip_null_optional_fields(item, item_schema) for item in payload]
+    if not isinstance(payload, dict) or not isinstance(schema, dict):
+        return payload
+    if not _is_object_schema(schema):
+        return payload
+
+    required = set(schema.get("required") or [])
+    properties = schema.get("properties") or {}
+    normalized = {}
+    for key, value in payload.items():
+        property_schema = properties.get(key)
+        if value is None and key in properties and key not in required:
+            continue
+        normalized[key] = _strip_null_optional_fields(value, property_schema)
+    return normalized
+
+
+def _build_system_prompt(prompt_file: Path, schema_file: Path) -> str:
+    system_prompt = prompt_file.read_text()
+    schema_text = schema_file.read_text()
+    return (
+        system_prompt
+        + "\n\n# Output schema\n\n"
+        + "Your output MUST validate against this JSON Schema. "
+        + "Pay attention to nested objects, required fields, and "
+        + "`additionalProperties: false`.\n\n"
+        + f"```json\n{schema_text}\n```\n"
+    )
+
+
+def _sandbox_name_for_tools(allowed_tools: list[str]) -> str:
+    return "workspace_write" if "Bash" in allowed_tools else "read_only"
+
+
+def _sdk_sandbox(sdk: Any, sandbox_name: str) -> Any:
+    return getattr(sdk.Sandbox, sandbox_name)
+
+
+def _config_overrides_for_add_dirs(add_dirs: list[Path]) -> tuple[str, ...]:
+    roots = [str(p.resolve()) for p in add_dirs]
+    if not roots:
+        return ()
+    encoded = json.dumps(roots)
+    return (f"sandbox_workspace_write.writable_roots={encoded}",)
+
+
+async def _run_turn_with_heartbeat(
+    thread: Any,
+    prompt: str,
+    *,
+    output_schema: dict,
+    sandbox: Any,
+    stage: str,
+    artifact_name: str,
+    model: str,
+    started_at: float,
+) -> Any:
+    stop = asyncio.Event()
+    heartbeat = asyncio.create_task(
+        _heartbeat_loop(
+            stop,
+            stage=stage,
+            artifact_name=artifact_name,
+            model=model,
+            started_at=started_at,
+        )
+    )
+    try:
+        return await thread.run(
+            prompt,
+            output_schema=output_schema,
+            sandbox=sandbox,
+        )
+    finally:
+        stop.set()
+        heartbeat.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat
+
+
+async def _heartbeat_loop(
+    stop: asyncio.Event,
+    *,
+    stage: str,
+    artifact_name: str,
+    model: str,
+    started_at: float,
+    interval_s: float = 30.0,
+) -> None:
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval_s)
+        except TimeoutError:
+            _log_progress(
+                event="heartbeat",
+                stage=stage,
+                artifact_name=artifact_name,
+                model=model,
+                elapsed_s=time.monotonic() - started_at,
+            )
+
+
+def _log_progress(
+    *,
+    event: str,
+    stage: str,
+    artifact_name: str,
+    model: str,
+    elapsed_s: float,
+) -> None:
+    log.info(
+        "[%s/%s] %s model=%s elapsed=%ds",
+        stage,
+        artifact_name,
+        event,
+        model,
+        int(elapsed_s),
+    )
+
+
+def _result_to_text_and_dict(result: Any, thread: Any) -> tuple[str, dict[str, Any]]:
+    text = result.final_response or ""
+    usage = _usage_to_dict(getattr(result, "usage", None))
+    msg = {
+        "subtype": "success",
+        "is_error": False,
+        "duration_ms": getattr(result, "duration_ms", None),
+        "duration_api_ms": None,
+        "num_turns": 1,
+        "session_id": getattr(thread, "id", None),
+        "stop_reason": getattr(result, "status", None),
+        "total_cost_usd": None,
+        "usage": usage,
+        "result": text,
+        "model_usage": None,
+        "items": [_serialize_any(item) for item in getattr(result, "items", [])],
+    }
+    return text, msg
+
+
+def _usage_to_dict(usage: Any) -> dict[str, int]:
+    if usage is None:
+        return {}
+    total = getattr(usage, "total", None) or usage
+    return {
+        "input_tokens": getattr(total, "input_tokens", None),
+        "output_tokens": getattr(total, "output_tokens", None),
+        "cache_read_input_tokens": getattr(total, "cached_input_tokens", None),
+        "reasoning_output_tokens": getattr(total, "reasoning_output_tokens", None),
+        "total_tokens": getattr(total, "total_tokens", None),
+    }
 
 
 def _validate(text: str, schema_file: Path) -> list[str]:
     try:
-        payload = extract_json(text)
+        payload = _extract_payload_for_schema(text, schema_file)
     except ValueError as e:
         return [f"json_extract: {e}"]
     return validate_schema(payload, schema_file)
@@ -346,59 +608,21 @@ def _write_artifact(fp, obj: Any) -> None:
     fp.flush()
 
 
+def _serialize_any(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json", by_alias=True)
+    if dataclasses.is_dataclass(value):
+        return dataclasses.asdict(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, list):
+        return [_serialize_any(item) for item in value]
+    if isinstance(value, dict):
+        return {k: _serialize_any(v) for k, v in value.items()}
+    return repr(value)
+
+
 def _json_fallback(o: Any) -> Any:
-    if dataclasses.is_dataclass(o):
-        return dataclasses.asdict(o)
     if isinstance(o, Path):
         return str(o)
-    return repr(o)
-
-
-def _serialize_message(msg: Any) -> dict[str, Any]:
-    if isinstance(msg, AssistantMessage):
-        return {
-            "kind": "assistant",
-            "model": msg.model,
-            "usage": msg.usage,
-            "content": [_serialize_block(b) for b in msg.content],
-        }
-    if isinstance(msg, ResultMessage):
-        return {"kind": "result", **_result_to_dict(msg)}
-    if dataclasses.is_dataclass(msg):
-        return {"kind": type(msg).__name__, **dataclasses.asdict(msg)}
-    return {"kind": type(msg).__name__, "repr": repr(msg)}
-
-
-def _serialize_block(b: Any) -> dict[str, Any]:
-    if isinstance(b, TextBlock):
-        return {"type": "text", "text": b.text}
-    if isinstance(b, ThinkingBlock):
-        return {"type": "thinking", "thinking": b.thinking}
-    if isinstance(b, ToolUseBlock):
-        return {"type": "tool_use", "id": b.id, "name": b.name, "input": b.input}
-    if isinstance(b, ToolResultBlock):
-        return {
-            "type": "tool_result",
-            "tool_use_id": b.tool_use_id,
-            "content": b.content,
-            "is_error": b.is_error,
-        }
-    if dataclasses.is_dataclass(b):
-        return dataclasses.asdict(b)
-    return {"type": type(b).__name__, "repr": repr(b)}
-
-
-def _result_to_dict(msg: ResultMessage) -> dict[str, Any]:
-    return {
-        "subtype": msg.subtype,
-        "is_error": msg.is_error,
-        "duration_ms": msg.duration_ms,
-        "duration_api_ms": msg.duration_api_ms,
-        "num_turns": msg.num_turns,
-        "session_id": msg.session_id,
-        "stop_reason": msg.stop_reason,
-        "total_cost_usd": msg.total_cost_usd,
-        "usage": msg.usage,
-        "result": msg.result,
-        "model_usage": msg.model_usage,
-    }
+    return _serialize_any(o)
